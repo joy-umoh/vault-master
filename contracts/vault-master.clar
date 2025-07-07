@@ -156,3 +156,119 @@
     )
   )
 )
+
+(define-read-only (is-liquidatable (loan-id uint))
+  ;; Validate loan ID before processing
+  (if (or (> loan-id (var-get loan-nonce)) (is-none (get-loan-details loan-id)))
+    false
+    (match (get-loan-details loan-id)
+      loan-data (let (
+          (updated-interest (+ (get interest-accumulated loan-data)
+            (calculate-interest (get loan-amount loan-data)
+              (- (get-current-stacks-block-height)
+                (get last-interest-height loan-data)
+              ))
+          ))
+          (collateral-ratio (calculate-collateral-ratio (get collateral-amount loan-data)
+            (get loan-amount loan-data) updated-interest
+          ))
+        )
+        (< collateral-ratio (* LIQUIDATION-THRESHOLD u10))
+      )
+      false
+    )
+  )
+)
+
+;; CORE LENDING FUNCTIONS
+
+;; Deposit STX as collateral
+(define-public (deposit (amount uint))
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    ;; Transfer STX from sender to contract
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    ;; Update user's deposit balance
+    (map-set user-deposits tx-sender (+ (get-user-deposit tx-sender) amount))
+    ;; Update total deposits tracking
+    (map-set total-deposits (get-current-stacks-block-height)
+      (+
+        (default-to u0
+          (map-get? total-deposits (get-current-stacks-block-height))
+        )
+        amount
+      ))
+    ;; Update global collateral counter
+    (var-set total-collateral (+ (var-get total-collateral) amount))
+    (ok amount)
+  )
+)
+
+;; Withdraw available collateral
+(define-public (withdraw (amount uint))
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (> amount u0) ERR-INVALID-AMOUNT)
+    (let ((current-deposit (get-user-deposit tx-sender)))
+      ;; Verify sufficient balance
+      (asserts! (>= current-deposit amount) ERR-INSUFFICIENT-BALANCE)
+      ;; Transfer STX from contract to sender
+      (try! (as-contract (stx-transfer? amount (as-contract tx-sender) tx-sender)))
+      ;; Update user's deposit balance
+      (map-set user-deposits tx-sender (- current-deposit amount))
+      ;; Update global collateral counter
+      (var-set total-collateral (- (var-get total-collateral) amount))
+      (ok amount)
+    )
+  )
+)
+
+;; Create new collateralized loan
+(define-public (borrow
+    (collateral-amount uint)
+    (loan-amount uint)
+  )
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (> collateral-amount u0) ERR-INVALID-AMOUNT)
+    (asserts! (> loan-amount u0) ERR-INVALID-AMOUNT)
+    (let (
+        (user-deposit (get-user-deposit tx-sender))
+        (collateral-value (* collateral-amount u1000))
+        (minimum-collateral-required (* loan-amount COLLATERAL-RATIO u10))
+        (loan-id (+ (var-get loan-nonce) u1))
+        (current-height (get-current-stacks-block-height))
+      )
+      ;; Verify sufficient collateral balance
+      (asserts! (>= user-deposit collateral-amount) ERR-INSUFFICIENT-BALANCE)
+      ;; Verify collateral ratio compliance
+      (asserts! (>= collateral-value minimum-collateral-required)
+        ERR-INSUFFICIENT-COLLATERAL
+      )
+      ;; Lock collateral by reducing available deposit
+      (map-set user-deposits tx-sender (- user-deposit collateral-amount))
+      ;; Create loan record
+      (map-set loans { loan-id: loan-id } {
+        borrower: tx-sender,
+        collateral-amount: collateral-amount,
+        loan-amount: loan-amount,
+        interest-accumulated: u0,
+        creation-height: current-height,
+        last-interest-height: current-height,
+        status: "active",
+      })
+      ;; Update user's loan tracking
+      (map-set user-loans tx-sender
+        (unwrap! (as-max-len? (append (get-user-loans tx-sender) loan-id) u20)
+          ERR-NOT-AUTHORIZED
+        ))
+      ;; Update protocol counters
+      (var-set loan-nonce loan-id)
+      (var-set total-borrowed (+ (var-get total-borrowed) loan-amount))
+      ;; Transfer borrowed amount to user
+      (try! (as-contract (stx-transfer? loan-amount (as-contract tx-sender) tx-sender)))
+      (ok loan-id)
+    )
+  )
+)
