@@ -80,3 +80,79 @@
     status: (string-ascii 20),
   }
 )
+
+;; User loan association mapping
+(define-map user-loans
+  principal
+  (list 20 uint)
+)
+
+;; Protocol state variables
+(define-data-var loan-nonce uint u0)
+(define-data-var total-collateral uint u0)
+(define-data-var total-borrowed uint u0)
+(define-data-var paused bool false)
+
+;; ADMINISTRATIVE FUNCTIONS
+
+(define-public (set-paused (paused-state bool))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+    (var-set paused paused-state)
+    (ok paused-state)
+  )
+)
+
+;; READ-ONLY UTILITY FUNCTIONS
+
+(define-read-only (get-current-stacks-block-height)
+  stacks-block-height
+)
+
+(define-read-only (get-user-deposit (user principal))
+  (default-to u0 (map-get? user-deposits user))
+)
+
+(define-read-only (get-loan-details (loan-id uint))
+  (map-get? loans { loan-id: loan-id })
+)
+
+(define-read-only (get-user-loans (user principal))
+  (default-to (list) (map-get? user-loans user))
+)
+
+(define-read-only (get-protocol-stats)
+  {
+    total-collateral: (var-get total-collateral),
+    total-borrowed: (var-get total-borrowed),
+    protocol-fees: (default-to u0 (map-get? protocol-fees (get-current-stacks-block-height))),
+    loan-count: (var-get loan-nonce),
+  }
+)
+
+;; MATHEMATICAL CALCULATION FUNCTIONS
+
+(define-read-only (calculate-interest
+    (principal-amount uint)
+    (blocks-elapsed uint)
+  )
+  (let (
+      (interest-per-block (/ (* principal-amount INTEREST-RATE-PER-BLOCK) u1000000))
+      (total-interest (* interest-per-block blocks-elapsed))
+    )
+    total-interest
+  )
+)
+
+(define-read-only (calculate-collateral-ratio
+    (collateral-amount uint)
+    (loan-amount uint)
+    (interest-accumulated uint)
+  )
+  (let ((total-debt (+ loan-amount interest-accumulated)))
+    (if (is-eq total-debt u0)
+      u0
+      (/ (* collateral-amount u1000) total-debt)
+    )
+  )
+)
