@@ -272,3 +272,117 @@
     )
   )
 )
+
+;; LOAN MANAGEMENT FUNCTIONS
+
+;; Private function to update loan interest
+(define-private (update-loan-interest (loan-id uint))
+  (match (get-loan-details loan-id)
+    loan-data (let (
+        (current-height (get-current-stacks-block-height))
+        (blocks-elapsed (- current-height (get last-interest-height loan-data)))
+        (loan-amount (get loan-amount loan-data))
+        (new-interest (calculate-interest loan-amount blocks-elapsed))
+        (current-interest (get interest-accumulated loan-data))
+        (updated-interest (+ current-interest new-interest))
+        (protocol-fee (/ (* new-interest PROTOCOL-FEE-PERCENT) u100))
+      )
+      ;; Update protocol fee tracking
+      (map-set protocol-fees current-height
+        (+ (default-to u0 (map-get? protocol-fees current-height)) protocol-fee)
+      )
+      ;; Update loan with accrued interest
+      (map-set loans { loan-id: loan-id }
+        (merge loan-data {
+          interest-accumulated: updated-interest,
+          last-interest-height: current-height,
+        })
+      )
+      (ok updated-interest)
+    )
+    ERR-LOAN-NOT-FOUND
+  )
+)
+
+;; Repay loan (partial or full repayment)
+(define-public (repay-loan
+    (loan-id uint)
+    (repay-amount uint)
+  )
+  (begin
+    (asserts! (not (var-get paused)) ERR-NOT-AUTHORIZED)
+    (asserts! (> repay-amount u0) ERR-INVALID-AMOUNT)
+    ;; Validate loan existence
+    (asserts! (<= loan-id (var-get loan-nonce)) ERR-INVALID-LOAN-ID)
+    (asserts! (is-some (get-loan-details loan-id)) ERR-LOAN-NOT-FOUND)
+    ;; Update interest before repayment
+    (try! (update-loan-interest loan-id))
+    (match (get-loan-details loan-id)
+      loan-data (let (
+          (borrower (get borrower loan-data))
+          (loan-amount (get loan-amount loan-data))
+          (interest (get interest-accumulated loan-data))
+          (collateral (get collateral-amount loan-data))
+          (total-owed (+ loan-amount interest))
+          (is-full-repayment (>= repay-amount total-owed))
+          (actual-repayment (if is-full-repayment
+            total-owed
+            repay-amount
+          ))
+          (remaining-loan (if is-full-repayment
+            u0
+            (- loan-amount
+              (if (>= actual-repayment interest)
+                (- actual-repayment interest)
+                u0
+              ))
+          ))
+          (remaining-interest (if is-full-repayment
+            u0
+            (if (>= actual-repayment interest)
+              u0
+              (- interest actual-repayment)
+            )
+          ))
+        )
+        ;; Verify borrower authorization
+        (asserts! (is-eq tx-sender borrower) ERR-NOT-AUTHORIZED)
+        ;; Process repayment transfer
+        (try! (stx-transfer? actual-repayment tx-sender (as-contract tx-sender)))
+        (if is-full-repayment
+          (begin
+            ;; Full repayment: close loan and release collateral
+            (map-set loans { loan-id: loan-id }
+              (merge loan-data {
+                loan-amount: u0,
+                interest-accumulated: u0,
+                status: "repaid",
+              })
+            )
+            ;; Return collateral to borrower
+            (map-set user-deposits borrower
+              (+ (get-user-deposit borrower) collateral)
+            )
+            ;; Update global borrowed amount
+            (var-set total-borrowed (- (var-get total-borrowed) loan-amount))
+          )
+          (begin
+            ;; Partial repayment: update loan balances
+            (map-set loans { loan-id: loan-id }
+              (merge loan-data {
+                loan-amount: remaining-loan,
+                interest-accumulated: remaining-interest,
+              })
+            )
+            ;; Update global borrowed amount
+            (var-set total-borrowed
+              (- (var-get total-borrowed) (- loan-amount remaining-loan))
+            )
+          )
+        )
+        (ok actual-repayment)
+      )
+      ERR-LOAN-NOT-FOUND
+    )
+  )
+)
